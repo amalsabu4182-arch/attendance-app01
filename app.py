@@ -10,12 +10,6 @@ import os
 
 # --- Basic Flask App Setup ---
 app = Flask(__name__)
-
-# --- TEMPORARY CODE TO INITIALIZE DATABASE ---
-with app.app_context():
-    init_db()
-# -------------------------------------------
-
 # Vercel uses a temporary directory for its file system
 DATABASE = os.path.join('/tmp', 'attendance.db')
 
