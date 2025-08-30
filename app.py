@@ -10,15 +10,15 @@ import os
 
 # --- Basic Flask App Setup ---
 app = Flask(__name__)
-# Vercel uses a temporary directory for its file system
-DATABASE = os.path.join('/tmp', 'attendance.db')
 
 
 # --- Database Functions (Defined Early) ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
+        # Vercel's ephemeral filesystem requires the path to be in /tmp
+        db_path = os.path.join('/tmp', 'attendance.db')
+        db = g._database = sqlite3.connect(db_path)
         db.row_factory = sqlite3.Row
     return db
 
@@ -33,7 +33,6 @@ def close_connection(exception):
 def init_db():
     with app.app_context():
         db = get_db()
-        # To read the schema in a serverless environment, we define it directly
         schema = """
             DROP TABLE IF EXISTS attendance;
             DROP TABLE IF EXISTS students;
@@ -83,7 +82,6 @@ def init_db():
         db.cursor().executescript(schema)
         db.commit()
 
-        # Add default admin user
         cursor = db.cursor()
         admin_pass_hash = generate_password_hash('adminpass')
         try:
@@ -97,9 +95,15 @@ def init_db():
         print("Database has been initialized on Vercel.")
 
 
+# --- TEMPORARY CODE TO INITIALIZE DATABASE ---
+with app.app_context():
+    init_db()
+
+
+# -------------------------------------------
+
 @app.cli.command('initdb')
 def initdb_command():
-    """Initializes the database."""
     init_db()
     print('Initialized the database.')
 
@@ -112,7 +116,6 @@ def index():
 
 # --- API Routes & Logic ---
 
-# --- Auth Routes ---
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json
@@ -120,7 +123,6 @@ def login():
     password = data.get('password')
     db = get_db()
 
-    # Admin/Teacher Login
     teacher = db.execute('SELECT * FROM teachers WHERE email = ?', (email,)).fetchone()
     if teacher:
         if teacher['approved'] == 0:
@@ -128,13 +130,9 @@ def login():
         if check_password_hash(teacher['password'], password):
             role = 'admin' if teacher['name'] == 'admin' else 'teacher'
             return jsonify({
-                "success": True,
-                "role": role,
-                "name": teacher['name'],
-                "class_id": teacher['class_id']
+                "success": True, "role": role, "name": teacher['name'], "class_id": teacher['class_id']
             })
 
-    # Student Login
     student = db.execute(
         'SELECT s.*, c.name as class_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.name = ?',
         (email,)).fetchone()
@@ -142,10 +140,7 @@ def login():
         student_pass = student['password'] if student['password'] else 'studentpass'
         if password == student_pass:
             return jsonify({
-                "success": True,
-                "role": "student",
-                "name": student['name'],
-                "class_name": student['class_name']
+                "success": True, "role": "student", "name": student['name'], "class_name": student['class_name']
             })
 
     return jsonify({"success": False, "message": "Invalid credentials or account not found."}), 401
@@ -154,11 +149,7 @@ def login():
 @app.route("/api/register/teacher", methods=["POST"])
 def register_teacher():
     data = request.json
-    name = data.get('name')
-    email = data.get('email')
-    password = data.get('password')
-    class_id = data.get('class_id')
-
+    name, email, password, class_id = data.get('name'), data.get('email'), data.get('password'), data.get('class_id')
     if not all([name, email, password, class_id]):
         return jsonify({"success": False, "message": "All fields are required."}), 400
 
@@ -173,7 +164,6 @@ def register_teacher():
         return jsonify({"success": False, "message": "An account with this email already exists."}), 409
 
 
-# --- Admin Routes ---
 @app.route("/api/admin/pending_teachers", methods=["GET"])
 def get_pending_teachers():
     db = get_db()
@@ -205,32 +195,26 @@ def manage_classes():
             return jsonify({"success": True, "message": f"Class '{name}' added."})
         except sqlite3.IntegrityError:
             return jsonify({"success": False, "message": "Class with this name already exists."}), 409
-
     cursor = db.execute('SELECT * FROM classes ORDER BY name ASC')
     classes = [dict(row) for row in cursor.fetchall()]
     return jsonify({"classes": classes})
 
 
-# --- Teacher Routes ---
 @app.route("/api/teacher/students", methods=["GET"])
 def get_students():
     class_id = request.args.get('class_id')
     db = get_db()
-    students_cursor = db.execute('SELECT * FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
-    students = [dict(row) for row in students_cursor.fetchall()]
+    cursor = db.execute('SELECT * FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
+    students = [dict(row) for row in cursor.fetchall()]
     return jsonify({"students": students})
 
 
 @app.route("/api/teacher/students", methods=["POST"])
 def add_student():
     data = request.json
-    name = data.get('name')
-    class_id = data.get('class_id')
-    password = data.get('password')  # Optional password
-
+    name, class_id, password = data.get('name'), data.get('class_id'), data.get('password')
     if not name or not class_id:
         return jsonify({"success": False, "message": "Name and class are required."}), 400
-
     db = get_db()
     try:
         db.execute('INSERT INTO students (name, class_id, password) VALUES (?, ?, ?)', (name, class_id, password))
@@ -252,11 +236,8 @@ def delete_student(student_id):
 @app.route("/api/teacher/mark", methods=["POST"])
 def mark_attendance():
     data = request.json
-    student_id = data.get('student_id')
-    status = data.get('status')
-    remarks = data.get('remarks', '')
+    student_id, status, remarks = data.get('student_id'), data.get('status'), data.get('remarks', '')
     date = datetime.date.today().isoformat()
-
     db = get_db()
     existing = db.execute('SELECT id FROM attendance WHERE student_id = ? AND date = ?', (student_id, date)).fetchone()
     if existing:
@@ -271,14 +252,11 @@ def mark_attendance():
 @app.route("/api/teacher/mark_all", methods=["POST"])
 def mark_all():
     data = request.json
-    status = data.get('status')
-    class_id = data.get('class_id')
+    status, class_id = data.get('status'), data.get('class_id')
     date = datetime.date.today().isoformat()
-
     db = get_db()
-    students_cursor = db.execute('SELECT id FROM students WHERE class_id = ?', (class_id,))
-    student_ids = [row['id'] for row in students_cursor.fetchall()]
-
+    cursor = db.execute('SELECT id FROM students WHERE class_id = ?', (class_id,))
+    student_ids = [row['id'] for row in cursor.fetchall()]
     for student_id in student_ids:
         existing = db.execute('SELECT id FROM attendance WHERE student_id = ? AND date = ?',
                               (student_id, date)).fetchone()
@@ -292,77 +270,58 @@ def mark_all():
 
 @app.route("/api/teacher/monthly_report")
 def get_monthly_report():
-    month_str = request.args.get('month')
-    class_id = request.args.get('class_id')
+    month_str, class_id = request.args.get('month'), request.args.get('class_id')
     if not month_str or not class_id:
         return jsonify({"error": "Month and class_id parameters are required."}), 400
-
     try:
         year, month = map(int, month_str.split('-'))
-        num_days = calendar.monthrange(year, month)[1]
-        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
+        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, calendar.monthrange(year, month)[1] + 1)]
     except ValueError:
         return jsonify({"error": "Invalid month format. Use YYYY-MM."}), 400
-
     db = get_db()
-    students_cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
-    students = [dict(row) for row in students_cursor.fetchall()]
-
-    holidays_cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
-    holidays = [row['date'] for row in holidays_cursor.fetchall()]
-
-    report = {}
-    summary = {}
+    cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
+    students = [dict(row) for row in cursor.fetchall()]
+    cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
+    holidays = [row['date'] for row in cursor.fetchall()]
+    report, summary = {}, {}
     for student in students:
-        student_id = student['id']
-        summary[student_id] = {'present': 0.0, 'absent': 0}
-        report[student_id] = {}
-        records_cursor = db.execute("SELECT date, status, remarks FROM attendance WHERE student_id = ? AND date LIKE ?",
-                                    (student_id, f"{month_str}-%"))
-        student_records = {row['date']: {'status': row['status'], 'remarks': row['remarks']} for row in
-                           records_cursor.fetchall()}
-
-        for day_str in days_in_month:
-            status = student_records.get(day_str, {}).get('status')
-            remarks = student_records.get(day_str, {}).get('remarks')
-
-            if day_str in holidays:
-                status = 'Holiday'
-
-            report[student_id][day_str] = {'status': status, 'remarks': remarks}
-
+        sid = student['id']
+        summary[sid] = {'present': 0.0, 'absent': 0}
+        report[sid] = {}
+        cursor = db.execute("SELECT date, status, remarks FROM attendance WHERE student_id = ? AND date LIKE ?",
+                            (sid, f"{month_str}-%"))
+        records = {row['date']: {'status': row['status'], 'remarks': row['remarks']} for row in cursor.fetchall()}
+        for day in days_in_month:
+            status = records.get(day, {}).get('status')
+            remarks = records.get(day, {}).get('remarks')
+            if day in holidays: status = 'Holiday'
+            report[sid][day] = {'status': status, 'remarks': remarks}
             if status == 'Full Day':
-                summary[student_id]['present'] += 1.0
+                summary[sid]['present'] += 1.0
             elif status == 'Half Day':
-                summary[student_id]['present'] += 0.5
+                summary[sid]['present'] += 0.5
             elif status == 'Absent':
-                summary[student_id]['absent'] += 1
-
+                summary[sid]['absent'] += 1
     return jsonify({
-        "students": students,
-        "report": report,
-        "summary": summary,
-        "days_in_month": [day.split('-')[2] for day in days_in_month],
+        "students": students, "report": report, "summary": summary,
+        "days_in_month": [d.split('-')[2] for d in days_in_month],
         "holidays": [d.split('-')[2] for d in holidays]
     })
 
 
-# --- Holiday Management Routes ---
 @app.route("/api/holidays", methods=["GET", "POST"])
 def manage_holidays():
     db = get_db()
     if request.method == "POST":
         data = request.json
         date = data.get('date')
-        if not date:
-            return jsonify({"success": False, "message": "Date is required."}), 400
+        if not date: return jsonify({"success": False, "message": "Date is required."}), 400
         try:
             db.execute('INSERT INTO holidays (date) VALUES (?)', (date,))
             db.commit()
             return jsonify({"success": True, "message": f"Holiday on '{date}' added."})
         except sqlite3.IntegrityError:
             return jsonify({"success": False, "message": f"Holiday on '{date}' already exists."}), 409
-
     cursor = db.execute('SELECT date FROM holidays ORDER BY date ASC')
     holidays = [row['date'] for row in cursor.fetchall()]
     return jsonify({"holidays": holidays})
@@ -378,113 +337,76 @@ def delete_holiday(date_str):
     return jsonify({"success": True, "message": "Holiday deleted."})
 
 
-# --- Student Routes ---
 @app.route("/api/student/data", methods=["GET"])
 def get_student_data():
     student_name = request.args.get('name')
     db = get_db()
     student = db.execute('SELECT id FROM students WHERE name = ?', (student_name,)).fetchone()
-    if not student:
-        return jsonify({"error": "Student not found"}), 404
-
-    student_id = student['id']
-    records_cursor = db.execute('SELECT date, status, remarks FROM attendance WHERE student_id = ? ORDER BY date DESC',
-                                (student_id,))
-    records = [dict(row) for row in records_cursor.fetchall()]
-
-    present_days = 0.0
-    absent_days = 0
-    total_marked = 0
-
+    if not student: return jsonify({"error": "Student not found"}), 404
+    sid = student['id']
+    cursor = db.execute('SELECT date, status, remarks FROM attendance WHERE student_id = ? ORDER BY date DESC', (sid,))
+    records = [dict(row) for row in cursor.fetchall()]
+    present, absent, total = 0.0, 0, 0
     for r in records:
         if r['status'] in ['Full Day', 'Half Day', 'Absent']:
-            total_marked += 1
+            total += 1
             if r['status'] == 'Full Day':
-                present_days += 1.0
+                present += 1.0
             elif r['status'] == 'Half Day':
-                present_days += 0.5
+                present += 0.5
             elif r['status'] == 'Absent':
-                absent_days += 1
-
-    percentage = (present_days / total_marked * 100) if total_marked > 0 else 0
-
+                absent += 1
+    percentage = (present / total * 100) if total > 0 else 0
     return jsonify({
-        "records": records,
-        "present_days": f"{present_days:.1f}",
-        "absent_days": absent_days,
-        "percentage": round(percentage)
+        "records": records, "present_days": f"{present:.1f}", "absent_days": absent, "percentage": round(percentage)
     })
 
 
 @app.route("/api/teacher/monthly_report/export", methods=["GET"])
 def export_monthly_report():
-    month_str = request.args.get('month')
-    class_id = request.args.get('class_id')
-
-    if not month_str or not class_id:
-        return "Month and class_id are required.", 400
-
+    month_str, class_id = request.args.get('month'), request.args.get('class_id')
+    if not month_str or not class_id: return "Month and class_id are required.", 400
     try:
         year, month = map(int, month_str.split('-'))
-        num_days = calendar.monthrange(year, month)[1]
-        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
+        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, calendar.monthrange(year, month)[1] + 1)]
     except ValueError:
         return "Invalid month format. Use YYYY-MM.", 400
-
     db = get_db()
-    students_cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
-    students = [dict(row) for row in students_cursor.fetchall()]
-
-    holidays_cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
-    holidays = [row['date'] for row in holidays_cursor.fetchall()]
-
+    cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
+    students = [dict(row) for row in cursor.fetchall()]
+    cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
+    holidays = [row['date'] for row in cursor.fetchall()]
     report_data = []
     for student in students:
-        student_id = student['id']
-        records_cursor = db.execute("SELECT date, status FROM attendance WHERE student_id = ? AND date LIKE ?",
-                                    (student_id, f"{month_str}-%"))
-        student_records = {row['date']: row['status'] for row in records_cursor.fetchall()}
-
+        sid = student['id']
+        cursor = db.execute("SELECT date, status FROM attendance WHERE student_id = ? AND date LIKE ?",
+                            (sid, f"{month_str}-%"))
+        records = {row['date']: row['status'] for row in cursor.fetchall()}
         row_data = [student['name']]
-        present_days = 0.0
-        absent_days = 0
-        for day_str in days_in_month:
-            status = student_records.get(day_str)
-            if day_str in holidays:
-                status = 'Holiday'
-
+        present, absent = 0.0, 0
+        for day in days_in_month:
+            status = records.get(day)
+            if day in holidays: status = 'Holiday'
+            cell = ''
             if status == 'Full Day':
-                row_data.append('F')
-                present_days += 1.0
+                cell, present = 'F', present + 1.0
             elif status == 'Half Day':
-                row_data.append('H')
-                present_days += 0.5
+                cell, present = 'H', present + 0.5
             elif status == 'Absent':
-                row_data.append('A')
-                absent_days += 1
+                cell, absent = 'A', absent + 1
             elif status == 'Holiday':
-                row_data.append('HLY')
-            else:
-                row_data.append('')
-        row_data.append(f"{present_days:.1f}")
-        row_data.append(absent_days)
+                cell = 'HLY'
+            row_data.append(cell)
+        row_data.extend([f"{present:.1f}", absent])
         report_data.append(row_data)
-
-    headers = ['Student Name'] + [str(d.split('-')[2]) for d in days_in_month] + ['Present (Days)', 'Absent (Days)']
-
+    headers = ['Student Name'] + [d.split('-')[2] for d in days_in_month] + ['Present (Days)', 'Absent (Days)']
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(headers)
     writer.writerows(report_data)
-
     output_bytes = BytesIO(output.getvalue().encode('utf-8'))
     output_bytes.seek(0)
-
     return send_file(
-        output_bytes,
-        mimetype='text/csv',
-        as_attachment=True,
+        output_bytes, mimetype='text/csv', as_attachment=True,
         download_name=f'attendance_report_{month_str}.csv'
     )
-
-
