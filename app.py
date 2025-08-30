@@ -4,22 +4,20 @@ import datetime
 import calendar
 import csv
 from io import StringIO, BytesIO
-from flask import Flask, render_template, request, jsonify, g, send_file, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, g, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
-import pytz
+import os
 
 # --- Basic Flask App Setup ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-very-secret-key-change-this'
-DATABASE = 'attendance.db'
+# --- TEMPORARY CODE TO INITIALIZE DATABASE ---
+with app.app_context():
+    init_db()
+# Vercel uses a temporary directory for its file system
+DATABASE = os.path.join('/tmp', 'attendance.db')
 
-# --- Timezone Helper ---
-def get_ist_today():
-    ist = pytz.timezone('Asia/Kolkata')
-    return datetime.datetime.now(ist).date()
 
-# --- Database Functions ---
+# --- Database Functions (Defined Early) ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
@@ -27,404 +25,392 @@ def get_db():
         db.row_factory = sqlite3.Row
     return db
 
+
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
     if db is not None:
         db.close()
 
+
 def init_db():
     with app.app_context():
         db = get_db()
-        with app.open_resource('schema.sql', mode='r') as f:
-            db.cursor().executescript(f.read())
-        
-        # Create a default admin user if one doesn't exist
-        cursor = db.cursor()
-        cursor.execute("SELECT * FROM users WHERE username = 'admin'")
-        if cursor.fetchone() is None:
-            hashed_password = generate_password_hash('adminpass')
-            cursor.execute(
-                'INSERT INTO users (username, password, full_name, role) VALUES (?, ?, ?, ?)',
-                ('admin', hashed_password, 'Administrator', 'admin')
-            )
-            print("Admin user created with username 'admin' and password 'adminpass'.")
-        
-        # Create a default class if none exist
-        cursor.execute("SELECT * FROM classes")
-        if cursor.fetchone() is None:
-            cursor.execute("INSERT INTO classes (name) VALUES (?)", ('Default Class',))
-            print("Created 'Default Class'.")
+        # To read the schema in a serverless environment, we define it directly
+        schema = """
+            DROP TABLE IF EXISTS attendance;
+            DROP TABLE IF EXISTS students;
+            DROP TABLE IF EXISTS holidays;
+            DROP TABLE IF EXISTS teachers;
+            DROP TABLE IF EXISTS classes;
 
+            CREATE TABLE classes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE teachers (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              email TEXT NOT NULL UNIQUE,
+              password TEXT NOT NULL,
+              class_id INTEGER,
+              approved INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY (class_id) REFERENCES classes (id)
+            );
+
+            CREATE TABLE students (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              password TEXT,
+              class_id INTEGER NOT NULL,
+              UNIQUE(name, class_id),
+              FOREIGN KEY (class_id) REFERENCES classes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE attendance (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              student_id INTEGER NOT NULL,
+              date TEXT NOT NULL,
+              status TEXT NOT NULL,
+              remarks TEXT,
+              UNIQUE(student_id, date),
+              FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE holidays (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              date TEXT NOT NULL UNIQUE
+            );
+        """
+        db.cursor().executescript(schema)
         db.commit()
-        print("Database initialized.")
+
+        # Add default admin user
+        cursor = db.cursor()
+        admin_pass_hash = generate_password_hash('adminpass')
+        try:
+            cursor.execute('INSERT INTO teachers (name, email, password, approved) VALUES (?, ?, ?, ?)',
+                           ('admin', 'admin@example.com', admin_pass_hash, 1))
+            db.commit()
+            print("Admin user created.")
+        except sqlite3.IntegrityError:
+            print("Admin user already exists.")
+
+        print("Database has been initialized on Vercel.")
+
 
 @app.cli.command('initdb')
 def initdb_command():
+    """Initializes the database."""
     init_db()
+    print('Initialized the database.')
 
-# --- Auth Decorators & User Helpers ---
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return jsonify({"success": False, "message": "Authentication required."}), 401
-        return f(*args, **kwargs)
-    return decorated_function
 
-def role_required(role):
-    def decorator(f):
-        @wraps(f)
-        @login_required
-        def decorated_function(*args, **kwargs):
-            if session.get('role') != role:
-                return jsonify({"success": False, "message": "Permission denied."}), 403
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-# --- API Routes ---
+# --- Main App Route ---
 @app.route("/")
 def index():
     return render_template('index.html')
 
-@app.route("/api/register/teacher", methods=["POST"])
-def register_teacher():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
-    full_name = data.get('full_name')
-    class_id = data.get('class_id')
 
-    if not all([username, password, full_name, class_id]):
-        return jsonify({"success": False, "message": "All fields are required."}), 400
+# --- API Routes & Logic ---
 
-    db = get_db()
-    try:
-        hashed_password = generate_password_hash(password)
-        db.execute(
-            'INSERT INTO users (username, password, full_name, role, class_id, teacher_status) VALUES (?, ?, ?, ?, ?, ?)',
-            (username, hashed_password, full_name, 'teacher', class_id, 'pending')
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        return jsonify({"success": False, "message": "Username already exists."}), 409
-    
-    return jsonify({"success": True, "message": "Registration successful. Please wait for admin approval."})
-
+# --- Auth Routes ---
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json
-    username = data.get('username')
+    email = data.get('email')
     password = data.get('password')
     db = get_db()
-    
-    user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-    
-    if user and check_password_hash(user['password'], password):
-        if user['role'] == 'teacher' and user['teacher_status'] != 'approved':
-            return jsonify({"success": False, "message": "Your account is pending approval."}), 403
-        
-        session.clear()
-        session['user_id'] = user['id']
-        session['username'] = user['username']
-        session['full_name'] = user['full_name']
-        session['role'] = user['role']
-        session['class_id'] = user['class_id']
-        
-        return jsonify({
-            "success": True, 
-            "user": {
-                "name": user['full_name'],
-                "role": user['role']
-            }
-        })
-    
-    return jsonify({"success": False, "message": "Invalid username or password"}), 401
 
-@app.route("/api/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return jsonify({"success": True, "message": "Logged out successfully."})
+    # Admin/Teacher Login
+    teacher = db.execute('SELECT * FROM teachers WHERE email = ?', (email,)).fetchone()
+    if teacher:
+        if teacher['approved'] == 0:
+            return jsonify({"success": False, "message": "Your account is pending admin approval."}), 403
+        if check_password_hash(teacher['password'], password):
+            role = 'admin' if teacher['name'] == 'admin' else 'teacher'
+            return jsonify({
+                "success": True,
+                "role": role,
+                "name": teacher['name'],
+                "class_id": teacher['class_id']
+            })
 
-@app.route("/api/session", methods=["GET"])
-@login_required
-def get_session():
-    return jsonify({
-        "success": True,
-        "user": {
-            "name": session['full_name'],
-            "role": session['role']
-        }
-    })
+    # Student Login
+    student = db.execute(
+        'SELECT s.*, c.name as class_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.name = ?',
+        (email,)).fetchone()
+    if student:
+        student_pass = student['password'] if student['password'] else 'studentpass'
+        if password == student_pass:
+            return jsonify({
+                "success": True,
+                "role": "student",
+                "name": student['name'],
+                "class_name": student['class_name']
+            })
+
+    return jsonify({"success": False, "message": "Invalid credentials or account not found."}), 401
+
+
+@app.route("/api/register/teacher", methods=["POST"])
+def register_teacher():
+    data = request.json
+    name = data.get('name')
+    email = data.get('email')
+    password = data.get('password')
+    class_id = data.get('class_id')
+
+    if not all([name, email, password, class_id]):
+        return jsonify({"success": False, "message": "All fields are required."}), 400
+
+    password_hash = generate_password_hash(password)
+    db = get_db()
+    try:
+        db.execute('INSERT INTO teachers (name, email, password, class_id) VALUES (?, ?, ?, ?)',
+                   (name, email, password_hash, class_id))
+        db.commit()
+        return jsonify({"success": True, "message": "Registration successful! Please wait for admin approval."})
+    except sqlite3.IntegrityError:
+        return jsonify({"success": False, "message": "An account with this email already exists."}), 409
+
 
 # --- Admin Routes ---
 @app.route("/api/admin/pending_teachers", methods=["GET"])
-@role_required('admin')
 def get_pending_teachers():
     db = get_db()
-    teachers = db.execute("""
-        SELECT u.id, u.full_name, u.username, c.name as class_name
-        FROM users u JOIN classes c ON u.class_id = c.id
-        WHERE u.role = 'teacher' AND u.teacher_status = 'pending'
-    """).fetchall()
-    return jsonify([dict(row) for row in teachers])
+    cursor = db.execute(
+        'SELECT t.id, t.name, t.email, c.name as class_name FROM teachers t JOIN classes c ON t.class_id = c.id WHERE t.approved = 0')
+    pending = [dict(row) for row in cursor.fetchall()]
+    return jsonify({"pending_teachers": pending})
 
-@app.route("/api/admin/approve_teacher/<int:user_id>", methods=["POST"])
-@role_required('admin')
-def approve_teacher(user_id):
+
+@app.route("/api/admin/approve_teacher/<int:teacher_id>", methods=["POST"])
+def approve_teacher(teacher_id):
     db = get_db()
-    db.execute("UPDATE users SET teacher_status = 'approved' WHERE id = ? AND role = 'teacher'", (user_id,))
+    db.execute('UPDATE teachers SET approved = 1 WHERE id = ?', (teacher_id,))
     db.commit()
     return jsonify({"success": True, "message": "Teacher approved."})
+
 
 @app.route("/api/admin/classes", methods=["GET", "POST"])
 def manage_classes():
     db = get_db()
     if request.method == "POST":
-        # For adding a new class, we must ensure the user is an admin
-        if session.get('role') != 'admin':
-            return jsonify({"success": False, "message": "Permission denied."}), 403
-            
-        name = request.json.get('name')
+        data = request.json
+        name = data.get('name')
         if not name:
             return jsonify({"success": False, "message": "Class name is required."}), 400
         try:
-            db.execute("INSERT INTO classes (name) VALUES (?)", (name,))
+            db.execute('INSERT INTO classes (name) VALUES (?)', (name,))
             db.commit()
-            return jsonify({"success": True, "message": "Class added."})
+            return jsonify({"success": True, "message": f"Class '{name}' added."})
         except sqlite3.IntegrityError:
-            return jsonify({"success": False, "message": "Class name already exists."}), 409
+            return jsonify({"success": False, "message": "Class with this name already exists."}), 409
 
-    # For viewing classes (GET request), no login is required.
-    classes = db.execute("SELECT * FROM classes").fetchall()
-    return jsonify([dict(c) for c in classes])
+    cursor = db.execute('SELECT * FROM classes ORDER BY name ASC')
+    classes = [dict(row) for row in cursor.fetchall()]
+    return jsonify({"classes": classes})
+
 
 # --- Teacher Routes ---
-@app.route("/api/teacher/students", methods=["GET", "POST"])
-@role_required('teacher')
-def manage_teacher_students():
+@app.route("/api/teacher/students", methods=["GET"])
+def get_students():
+    class_id = request.args.get('class_id')
     db = get_db()
-    teacher_class_id = session.get('class_id')
-    
-    if request.method == "POST":
-        name = request.json.get('name')
-        username = request.json.get('username')
-        password = request.json.get('password', 'studentpass') # Default password
+    students_cursor = db.execute('SELECT * FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
+    students = [dict(row) for row in students_cursor.fetchall()]
+    return jsonify({"students": students})
 
-        if not all([name, username]):
-            return jsonify({"success": False, "message": "Name and username required."}), 400
-        
-        try:
-            hashed_password = generate_password_hash(password)
-            db.execute(
-                'INSERT INTO users (username, password, full_name, role, class_id) VALUES (?, ?, ?, ?, ?)',
-                (username, hashed_password, name, 'student', teacher_class_id)
-            )
-            db.commit()
-            return jsonify({"success": True, "message": "Student added."})
-        except sqlite3.IntegrityError:
-            return jsonify({"success": False, "message": "Username already exists."}), 409
 
-    students = db.execute("SELECT id, full_name FROM users WHERE role = 'student' AND class_id = ?", (teacher_class_id,)).fetchall()
-    return jsonify({"students": [dict(s) for s in students]})
+@app.route("/api/teacher/students", methods=["POST"])
+def add_student():
+    data = request.json
+    name = data.get('name')
+    class_id = data.get('class_id')
+    password = data.get('password')  # Optional password
 
-@app.route("/api/teacher/students/<int:student_id>", methods=["PUT", "DELETE"])
-@role_required('teacher')
-def update_teacher_student(student_id):
+    if not name or not class_id:
+        return jsonify({"success": False, "message": "Name and class are required."}), 400
+
     db = get_db()
-    teacher_class_id = session.get('class_id')
-    
-    # Verify student is in teacher's class
-    student = db.execute("SELECT id FROM users WHERE id = ? AND class_id = ?", (student_id, teacher_class_id)).fetchone()
-    if not student:
-        return jsonify({"success": False, "message": "Student not found in your class."}), 404
+    try:
+        db.execute('INSERT INTO students (name, class_id, password) VALUES (?, ?, ?)', (name, class_id, password))
+        db.commit()
+        return jsonify({"success": True, "message": f"Student '{name}' added."})
+    except sqlite3.IntegrityError:
+        return jsonify({"success": False, "message": f"Student '{name}' already exists in this class."}), 409
 
-    if request.method == "PUT":
-        name = request.json.get('name')
-        if not name:
-            return jsonify({"success": False, "message": "Name is required."}), 400
-        db.execute("UPDATE users SET full_name = ? WHERE id = ?", (name, student_id))
-        db.commit()
-        return jsonify({"success": True, "message": "Student updated."})
-    
-    if request.method == "DELETE":
-        db.execute("DELETE FROM users WHERE id = ?", (student_id,))
-        db.commit()
-        return jsonify({"success": True, "message": "Student and their records deleted."})
+
+@app.route("/api/teacher/students/<int:student_id>", methods=["DELETE"])
+def delete_student(student_id):
+    db = get_db()
+    db.execute('PRAGMA foreign_keys = ON')
+    db.execute('DELETE FROM students WHERE id = ?', (student_id,))
+    db.commit()
+    return jsonify({"success": True, "message": "Student deleted."})
+
 
 @app.route("/api/teacher/mark", methods=["POST"])
-@role_required('teacher')
 def mark_attendance():
     data = request.json
     student_id = data.get('student_id')
     status = data.get('status')
     remarks = data.get('remarks', '')
-    today = get_ist_today().isoformat()
+    date = datetime.date.today().isoformat()
+
     db = get_db()
-
-    # Check if student belongs to teacher's class
-    teacher_class_id = session.get('class_id')
-    student = db.execute("SELECT id FROM users WHERE id = ? AND role = 'student' AND class_id = ?", (student_id, teacher_class_id)).fetchone()
-    if not student:
-        return jsonify({"success": False, "message": "This student is not in your class."}), 403
-
-    existing = db.execute('SELECT id FROM attendance WHERE student_user_id = ? AND date = ?', (student_id, today)).fetchone()
+    existing = db.execute('SELECT id FROM attendance WHERE student_id = ? AND date = ?', (student_id, date)).fetchone()
     if existing:
         db.execute('UPDATE attendance SET status = ?, remarks = ? WHERE id = ?', (status, remarks, existing['id']))
     else:
-        db.execute('INSERT INTO attendance (student_user_id, date, status, remarks) VALUES (?, ?, ?, ?)', (student_id, today, status, remarks))
+        db.execute('INSERT INTO attendance (student_id, date, status, remarks) VALUES (?, ?, ?, ?)',
+                   (student_id, date, status, remarks))
     db.commit()
     return jsonify({"success": True, "message": "Attendance marked."})
 
-@app.route("/api/teacher/mark_all", methods=["POST"])
-@role_required('teacher')
-def mark_all():
-    status = request.json.get('status')
-    today = get_ist_today().isoformat()
-    teacher_class_id = session.get('class_id')
-    db = get_db()
 
-    students = db.execute("SELECT id FROM users WHERE role = 'student' AND class_id = ?", (teacher_class_id,)).fetchall()
-    student_ids = [row['id'] for row in students]
-    
+@app.route("/api/teacher/mark_all", methods=["POST"])
+def mark_all():
+    data = request.json
+    status = data.get('status')
+    class_id = data.get('class_id')
+    date = datetime.date.today().isoformat()
+
+    db = get_db()
+    students_cursor = db.execute('SELECT id FROM students WHERE class_id = ?', (class_id,))
+    student_ids = [row['id'] for row in students_cursor.fetchall()]
+
     for student_id in student_ids:
-        existing = db.execute('SELECT id FROM attendance WHERE student_user_id = ? AND date = ?', (student_id, today)).fetchone()
+        existing = db.execute('SELECT id FROM attendance WHERE student_id = ? AND date = ?',
+                              (student_id, date)).fetchone()
         if existing:
-            db.execute('UPDATE attendance SET status = ? WHERE id = ?', (status, existing['id']))
+            db.execute('UPDATE attendance SET status = ?, remarks = ? WHERE id = ?', (status, '', existing['id']))
         else:
-            db.execute('INSERT INTO attendance (student_user_id, date, status) VALUES (?, ?, ?)', (student_id, today, status))
+            db.execute('INSERT INTO attendance (student_id, date, status) VALUES (?, ?, ?)', (student_id, date, status))
     db.commit()
     return jsonify({"success": True, "message": f"All students marked as {status}."})
 
+
 @app.route("/api/teacher/monthly_report")
-@role_required('teacher')
 def get_monthly_report():
     month_str = request.args.get('month')
-    year, month = map(int, month_str.split('-'))
-    num_days = calendar.monthrange(year, month)[1]
-    days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
-    teacher_class_id = session.get('class_id')
-    
+    class_id = request.args.get('class_id')
+    if not month_str or not class_id:
+        return jsonify({"error": "Month and class_id parameters are required."}), 400
+
+    try:
+        year, month = map(int, month_str.split('-'))
+        num_days = calendar.monthrange(year, month)[1]
+        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
+    except ValueError:
+        return jsonify({"error": "Invalid month format. Use YYYY-MM."}), 400
+
     db = get_db()
-    students_cursor = db.execute("SELECT id, full_name FROM users WHERE role = 'student' AND class_id = ? ORDER BY full_name ASC", (teacher_class_id,))
+    students_cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
     students = [dict(row) for row in students_cursor.fetchall()]
 
     holidays_cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
     holidays = [row['date'] for row in holidays_cursor.fetchall()]
 
-    report = {s['id']: {} for s in students}
-    summary = {s['id']: {'present': 0.0, 'absent': 0} for s in students}
-
+    report = {}
+    summary = {}
     for student in students:
         student_id = student['id']
-        records_cursor = db.execute("SELECT date, status, remarks FROM attendance WHERE student_user_id = ? AND date LIKE ?", (student_id, f"{month_str}-%"))
-        student_records = {row['date']: {'status': row['status'], 'remarks': row['remarks']} for row in records_cursor.fetchall()}
-        
+        summary[student_id] = {'present': 0.0, 'absent': 0}
+        report[student_id] = {}
+        records_cursor = db.execute("SELECT date, status, remarks FROM attendance WHERE student_id = ? AND date LIKE ?",
+                                    (student_id, f"{month_str}-%"))
+        student_records = {row['date']: {'status': row['status'], 'remarks': row['remarks']} for row in
+                           records_cursor.fetchall()}
+
         for day_str in days_in_month:
             status = student_records.get(day_str, {}).get('status')
-            if day_str in holidays: status = 'Holiday'
-            
-            report[student_id][day_str] = {'status': status, 'remarks': student_records.get(day_str, {}).get('remarks')}
-            
-            if status == 'Full Day': summary[student_id]['present'] += 1.0
-            elif status == 'Half Day': summary[student_id]['present'] += 0.5
-            elif status == 'Absent': summary[student_id]['absent'] += 1
-            
+            remarks = student_records.get(day_str, {}).get('remarks')
+
+            if day_str in holidays:
+                status = 'Holiday'
+
+            report[student_id][day_str] = {'status': status, 'remarks': remarks}
+
+            if status == 'Full Day':
+                summary[student_id]['present'] += 1.0
+            elif status == 'Half Day':
+                summary[student_id]['present'] += 0.5
+            elif status == 'Absent':
+                summary[student_id]['absent'] += 1
+
     return jsonify({
-        "students": students, "report": report, "summary": summary,
-        "days_in_month": [d.split('-')[2] for d in days_in_month],
+        "students": students,
+        "report": report,
+        "summary": summary,
+        "days_in_month": [day.split('-')[2] for day in days_in_month],
         "holidays": [d.split('-')[2] for d in holidays]
     })
 
 
-# --- Holiday and Export Routes (Can be accessed by Teacher/Admin) ---
+# --- Holiday Management Routes ---
 @app.route("/api/holidays", methods=["GET", "POST"])
-@login_required
 def manage_holidays():
-    if session['role'] not in ['admin', 'teacher']:
-        return jsonify({"success": False, "message": "Permission denied."}), 403
     db = get_db()
     if request.method == "POST":
-        date = request.json.get('date')
-        if not date: return jsonify({"success": False, "message": "Date is required."}), 400
+        data = request.json
+        date = data.get('date')
+        if not date:
+            return jsonify({"success": False, "message": "Date is required."}), 400
         try:
             db.execute('INSERT INTO holidays (date) VALUES (?)', (date,))
             db.commit()
-            return jsonify({"success": True, "message": "Holiday added."})
+            return jsonify({"success": True, "message": f"Holiday on '{date}' added."})
         except sqlite3.IntegrityError:
-            return jsonify({"success": False, "message": "Holiday already exists."}), 409
-    
-    holidays_cursor = db.execute('SELECT date FROM holidays ORDER BY date ASC')
-    return jsonify({"holidays": [row['date'] for row in holidays_cursor.fetchall()]})
+            return jsonify({"success": False, "message": f"Holiday on '{date}' already exists."}), 409
+
+    cursor = db.execute('SELECT date FROM holidays ORDER BY date ASC')
+    holidays = [row['date'] for row in cursor.fetchall()]
+    return jsonify({"holidays": holidays})
+
 
 @app.route("/api/holidays/<string:date_str>", methods=["DELETE"])
-@login_required
 def delete_holiday(date_str):
-    if session['role'] not in ['admin', 'teacher']:
-        return jsonify({"success": False, "message": "Permission denied."}), 403
     db = get_db()
-    db.execute('DELETE FROM holidays WHERE date = ?', (date_str,))
+    result = db.execute('DELETE FROM holidays WHERE date = ?', (date_str,))
     db.commit()
+    if result.rowcount == 0:
+        return jsonify({"success": False, "message": "Holiday not found."}), 404
     return jsonify({"success": True, "message": "Holiday deleted."})
 
-@app.route("/api/teacher/monthly_report/export")
-@role_required('teacher')
-def export_monthly_report():
-    month_str = request.args.get('month')
-    teacher_class_id = session.get('class_id')
-    year, month = map(int, month_str.split('-'))
-    num_days = calendar.monthrange(year, month)[1]
-    days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
-    
-    db = get_db()
-    students = db.execute("SELECT id, full_name FROM users WHERE role = 'student' AND class_id = ? ORDER BY full_name ASC", (teacher_class_id,)).fetchall()
-    holidays = [r['date'] for r in db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",)).fetchall()]
-    
-    report_data = []
-    for student in students:
-        records = {r['date']: r['status'] for r in db.execute("SELECT date, status FROM attendance WHERE student_user_id = ? AND date LIKE ?", (student['id'], f"{month_str}-%")).fetchall()}
-        row_data = [student['full_name']]
-        present, absent = 0.0, 0
-        for day in days_in_month:
-            status = records.get(day)
-            if day in holidays: status = 'Holiday'
-            
-            if status == 'Full Day': row_data.append('F'); present += 1.0
-            elif status == 'Half Day': row_data.append('H'); present += 0.5
-            elif status == 'Absent': row_data.append('A'); absent += 1
-            elif status == 'Holiday': row_data.append('HLY')
-            else: row_data.append('')
-        row_data.extend([f"{present:.1f}", absent])
-        report_data.append(row_data)
-
-    headers = ['Student Name'] + [d.split('-')[2] for d in days_in_month] + ['Present (Days)', 'Absent (Days)']
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(headers)
-    writer.writerows(report_data)
-    
-    return send_file(BytesIO(output.getvalue().encode('utf-8')), mimetype='text/csv', as_attachment=True, download_name=f'report_{month_str}.csv')
 
 # --- Student Routes ---
 @app.route("/api/student/data", methods=["GET"])
-@role_required('student')
 def get_student_data():
-    student_id = session.get('user_id')
+    student_name = request.args.get('name')
     db = get_db()
-    records_cursor = db.execute('SELECT date, status, remarks FROM attendance WHERE student_user_id = ? ORDER BY date DESC', (student_id,))
+    student = db.execute('SELECT id FROM students WHERE name = ?', (student_name,)).fetchone()
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+
+    student_id = student['id']
+    records_cursor = db.execute('SELECT date, status, remarks FROM attendance WHERE student_id = ? ORDER BY date DESC',
+                                (student_id,))
     records = [dict(row) for row in records_cursor.fetchall()]
 
-    present_days, absent_days, total_days = 0.0, 0, 0
+    present_days = 0.0
+    absent_days = 0
+    total_marked = 0
+
     for r in records:
         if r['status'] in ['Full Day', 'Half Day', 'Absent']:
-            total_days += 1
-            if r['status'] == 'Full Day': present_days += 1.0
-            elif r['status'] == 'Half Day': present_days += 0.5
-            elif r['status'] == 'Absent': absent_days += 1
+            total_marked += 1
+            if r['status'] == 'Full Day':
+                present_days += 1.0
+            elif r['status'] == 'Half Day':
+                present_days += 0.5
+            elif r['status'] == 'Absent':
+                absent_days += 1
 
-    percentage = (present_days / total_days * 100) if total_days > 0 else 0
-    
+    percentage = (present_days / total_marked * 100) if total_marked > 0 else 0
+
     return jsonify({
         "records": records,
         "present_days": f"{present_days:.1f}",
@@ -432,5 +418,75 @@ def get_student_data():
         "percentage": round(percentage)
     })
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+@app.route("/api/teacher/monthly_report/export", methods=["GET"])
+def export_monthly_report():
+    month_str = request.args.get('month')
+    class_id = request.args.get('class_id')
+
+    if not month_str or not class_id:
+        return "Month and class_id are required.", 400
+
+    try:
+        year, month = map(int, month_str.split('-'))
+        num_days = calendar.monthrange(year, month)[1]
+        days_in_month = [f"{month_str}-{day:02d}" for day in range(1, num_days + 1)]
+    except ValueError:
+        return "Invalid month format. Use YYYY-MM.", 400
+
+    db = get_db()
+    students_cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name ASC', (class_id,))
+    students = [dict(row) for row in students_cursor.fetchall()]
+
+    holidays_cursor = db.execute("SELECT date FROM holidays WHERE date LIKE ?", (f"{month_str}-%",))
+    holidays = [row['date'] for row in holidays_cursor.fetchall()]
+
+    report_data = []
+    for student in students:
+        student_id = student['id']
+        records_cursor = db.execute("SELECT date, status FROM attendance WHERE student_id = ? AND date LIKE ?",
+                                    (student_id, f"{month_str}-%"))
+        student_records = {row['date']: row['status'] for row in records_cursor.fetchall()}
+
+        row_data = [student['name']]
+        present_days = 0.0
+        absent_days = 0
+        for day_str in days_in_month:
+            status = student_records.get(day_str)
+            if day_str in holidays:
+                status = 'Holiday'
+
+            if status == 'Full Day':
+                row_data.append('F')
+                present_days += 1.0
+            elif status == 'Half Day':
+                row_data.append('H')
+                present_days += 0.5
+            elif status == 'Absent':
+                row_data.append('A')
+                absent_days += 1
+            elif status == 'Holiday':
+                row_data.append('HLY')
+            else:
+                row_data.append('')
+        row_data.append(f"{present_days:.1f}")
+        row_data.append(absent_days)
+        report_data.append(row_data)
+
+    headers = ['Student Name'] + [str(d.split('-')[2]) for d in days_in_month] + ['Present (Days)', 'Absent (Days)']
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    writer.writerows(report_data)
+
+    output_bytes = BytesIO(output.getvalue().encode('utf-8'))
+    output_bytes.seek(0)
+
+    return send_file(
+        output_bytes,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f'attendance_report_{month_str}.csv'
+    )
+
