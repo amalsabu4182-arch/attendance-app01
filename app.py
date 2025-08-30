@@ -11,12 +11,6 @@ import pytz
 
 # --- Basic Flask App Setup ---
 app = Flask(__name__)
-
-# --- TEMPORARY CODE TO INITIALIZE DATABASE ---
-with app.app_context():
-    init_db()
-# -------------------------------------------
-
 app.config['SECRET_KEY'] = 'your-very-secret-key-change-this'
 DATABASE = 'attendance.db'
 
