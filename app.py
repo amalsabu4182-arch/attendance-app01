@@ -15,6 +15,7 @@ app = Flask(__name__)
 with app.app_context():
     init_db()
 # -------------------------------------------
+
 # Vercel uses a temporary directory for its file system
 DATABASE = os.path.join('/tmp', 'attendance.db')
 
@@ -491,4 +492,5 @@ def export_monthly_report():
         as_attachment=True,
         download_name=f'attendance_report_{month_str}.csv'
     )
+
 
