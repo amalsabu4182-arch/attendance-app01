@@ -95,13 +95,6 @@ def init_db():
         print("Database has been initialized on Vercel.")
 
 
-# --- TEMPORARY CODE TO INITIALIZE DATABASE ---
-with app.app_context():
-    init_db()
-
-
-# -------------------------------------------
-
 @app.cli.command('initdb')
 def initdb_command():
     init_db()
@@ -410,3 +403,4 @@ def export_monthly_report():
         output_bytes, mimetype='text/csv', as_attachment=True,
         download_name=f'attendance_report_{month_str}.csv'
     )
+
